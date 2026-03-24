@@ -46,26 +46,40 @@ if (-not $python) {
     }
 }
 
-# --- Install winremote-mcp ---
-Write-Host "  [2/6] Installing winremote-mcp..." -ForegroundColor White
+# --- Install winremote-mcp from fork ---
+Write-Host "  [2/6] Installing winremote-mcp (fork)..." -ForegroundColor White
 $prevEAP = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
-& $python -m pip install --upgrade winremote-mcp 2>&1 | Out-Null
+& $python -m pip install --upgrade "https://github.com/zbynekdrlik/winremote-mcp/archive/master.zip" 2>&1 | Out-Null
 $pipShow = & $python -m pip show winremote-mcp 2>&1 | Out-String
 $ErrorActionPreference = $prevEAP
 if ($pipShow -match "Version: (.+)") {
     Write-Host "        Installed v$($Matches[1].Trim())" -ForegroundColor Green
 } else {
     Write-Host "        [X] pip install failed" -ForegroundColor Red
-    Write-Host "        Try manually: $python -m pip install winremote-mcp" -ForegroundColor Yellow
+    Write-Host "        Try manually: $python -m pip install https://github.com/zbynekdrlik/winremote-mcp/archive/master.zip" -ForegroundColor Yellow
     return
 }
 
-# --- Generate auth key ---
-Write-Host "  [3/6] Generating auth key..." -ForegroundColor White
-$AuthKey = -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 32 | ForEach-Object { [char]$_ })
+# --- Generate or preserve auth key ---
+Write-Host "  [3/6] Configuring auth key..." -ForegroundColor White
+$ExistingKey = $null
+if (Test-Path "$ConfigDir\config.json") {
+    try {
+        $existingConfig = Get-Content "$ConfigDir\config.json" -Raw | ConvertFrom-Json
+        $ExistingKey = $existingConfig.auth_key
+        Write-Host "        Reusing existing auth key" -ForegroundColor Green
+    } catch {
+        Write-Host "        Could not read existing config, generating new key" -ForegroundColor Yellow
+    }
+}
+if (-not $ExistingKey) {
+    $ExistingKey = -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 32 | ForEach-Object { [char]$_ })
+    Write-Host "        Generated new auth key" -ForegroundColor Green
+}
+$AuthKey = $ExistingKey
 
-# --- Create config and start script ---
+# --- Create config and start scripts ---
 Write-Host "  [4/6] Creating config..." -ForegroundColor White
 if (-not (Test-Path $ConfigDir)) {
     New-Item -ItemType Directory -Path $ConfigDir -Force | Out-Null
@@ -92,66 +106,25 @@ echo  Port: $Port
 echo.
 :loop
 echo  [%date% %time%] Starting server...
-"$pythonPath" "$ConfigDir\start-winremote.py" --transport streamable-http --enable-all --host 0.0.0.0 --port $Port --auth-key "$AuthKey"
+"$pythonPath" -m winremote --transport streamable-http --enable-all --host 0.0.0.0 --port $Port --auth-key "$AuthKey"
 echo  [%date% %time%] Server exited (code %errorlevel%). Restarting in 10 seconds...
 timeout /t 10 /nobreak >nul
 goto loop
 "@ | Set-Content "$ConfigDir\start-winremote.bat"
 
-# Wrapper script that patches Snapshot defaults and Shell timeout handling
+# VBS launcher to run batch file hidden (no CMD window)
 @"
-"""WinRemote MCP wrapper with patches for Claude Code compatibility."""
-import subprocess
-import winremote.desktop as _desktop
-import winremote.__main__ as _main
-
-# --- Patch 1: Snapshot defaults for Claude-friendly image sizes ---
-_orig_take_screenshot = _desktop.take_screenshot
-def _patched_take_screenshot(quality: int = 40, max_width: int = 1280, monitor: int = 0) -> str:
-    return _orig_take_screenshot(quality=quality, max_width=max_width, monitor=monitor)
-_desktop.take_screenshot = _patched_take_screenshot
-
-# --- Patch 2: Shell timeout kills entire process tree (not just parent) ---
-_orig_subprocess_run = subprocess.run
-
-def _shell_run_with_tree_kill(args, **kwargs):
-    timeout = kwargs.pop("timeout", None)
-    if timeout is None:
-        return _orig_subprocess_run(args, **kwargs)
-    capture = kwargs.pop("capture_output", False)
-    if capture:
-        kwargs["stdout"] = subprocess.PIPE
-        kwargs["stderr"] = subprocess.PIPE
-    kwargs["creationflags"] = kwargs.get("creationflags", 0) | subprocess.CREATE_NEW_PROCESS_GROUP
-    proc = subprocess.Popen(args, **kwargs)
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-        return subprocess.CompletedProcess(args, proc.returncode, stdout, stderr)
-    except subprocess.TimeoutExpired:
-        try:
-            _orig_subprocess_run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, timeout=5)
-        except:
-            pass
-        proc.kill()
-        try:
-            proc.communicate(timeout=5)
-        except:
-            pass
-        raise
-
-_main.subprocess.run = _shell_run_with_tree_kill
-
-from winremote.__main__ import cli
-cli()
-"@ | Set-Content "$ConfigDir\start-winremote.py"
+Set WshShell = CreateObject("WScript.Shell")
+WshShell.Run """" & CreateObject("Scripting.FileSystemObject").GetParentFolderName(WScript.ScriptFullName) & "\start-winremote.bat""", 0, False
+"@ | Set-Content "$ConfigDir\start-winremote.vbs"
 
 Write-Host "        Config: $ConfigDir\config.json" -ForegroundColor Gray
-Write-Host "        Start:  $ConfigDir\start-winremote.bat" -ForegroundColor Gray
+Write-Host "        Start:  $ConfigDir\start-winremote.vbs (hidden)" -ForegroundColor Gray
 
 # --- Auto-start scheduled task ---
 Write-Host "  [5/6] Setting up auto-start..." -ForegroundColor White
 try {
-    $taskAction = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c `"$ConfigDir\start-winremote.bat`""
+    $taskAction = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$ConfigDir\start-winremote.vbs`""
     # Trigger at logon + every 5 minutes (task won't start a second instance if already running)
     $triggerLogon = New-ScheduledTaskTrigger -AtLogon
     $triggerRepeat = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5)
@@ -161,7 +134,7 @@ try {
     Write-Host "        Task 'WinRemoteMCP' registered (at logon + every 5 min)" -ForegroundColor Green
 } catch {
     Write-Host "        [!] Could not create scheduled task (need admin)" -ForegroundColor Yellow
-    Write-Host "        You can start manually: $ConfigDir\start-winremote.bat" -ForegroundColor Yellow
+    Write-Host "        You can start manually: $ConfigDir\start-winremote.vbs" -ForegroundColor Yellow
 }
 
 # --- Firewall ---
@@ -185,10 +158,10 @@ $localIP = (Get-NetIPAddress -AddressFamily IPv4 |
 if (-not $localIP) { $localIP = "WINDOWS_IP" }
 $hostName = $env:COMPUTERNAME.ToLower()
 
-# --- Start server now ---
+# --- Start server now (hidden) ---
 Write-Host ""
 Write-Host "  Starting server..." -ForegroundColor Cyan
-Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$ConfigDir\start-winremote.bat`"" -WindowStyle Normal
+Start-Process -FilePath "wscript.exe" -ArgumentList "`"$ConfigDir\start-winremote.vbs`""
 Start-Sleep -Seconds 2
 
 # Test if it's running
@@ -204,7 +177,7 @@ try {
 if ($running) {
     Write-Host "  Server is running!" -ForegroundColor Green
 } else {
-    Write-Host "  [!] Server may still be starting... check the window" -ForegroundColor Yellow
+    Write-Host "  [!] Server may still be starting... check Task Manager for python" -ForegroundColor Yellow
 }
 
 # --- Summary ---
@@ -226,7 +199,5 @@ Write-Host ""
 Write-Host "  Then restart Claude Code." -ForegroundColor Gray
 Write-Host ""
 Write-Host "  To uninstall later:" -ForegroundColor Gray
-Write-Host "  pip uninstall winremote-mcp" -ForegroundColor Gray
-Write-Host "  Unregister-ScheduledTask -TaskName WinRemoteMCP -Confirm:`$false" -ForegroundColor Gray
-Write-Host "  Remove-Item -Recurse $ConfigDir" -ForegroundColor Gray
+Write-Host "  irm https://raw.githubusercontent.com/zbynekdrlik/winremote-setup/master/uninstall.ps1 | iex" -ForegroundColor Gray
 Write-Host ""

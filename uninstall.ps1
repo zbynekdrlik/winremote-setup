@@ -1,5 +1,5 @@
 # WinRemote MCP - Uninstaller
-# Usage: irm https://raw.githubusercontent.com/zbynekdrlik/winremote-setup/main/uninstall.ps1 | iex
+# Usage: irm https://raw.githubusercontent.com/zbynekdrlik/winremote-setup/master/uninstall.ps1 | iex
 
 $ErrorActionPreference = "SilentlyContinue"
 $ConfigDir = "$env:USERPROFILE\.winremote-mcp"
@@ -11,7 +11,11 @@ Write-Host ""
 # Stop running server
 Write-Host "  [1/4] Stopping server..." -ForegroundColor White
 Get-Process -Name "python*" | Where-Object {
-    $_.CommandLine -match "winremote_mcp"
+    $_.CommandLine -match "winremote"
+} | Stop-Process -Force -ErrorAction SilentlyContinue
+# Also stop any wscript hosting the VBS launcher
+Get-Process -Name "wscript*" | Where-Object {
+    $_.CommandLine -match "winremote"
 } | Stop-Process -Force -ErrorAction SilentlyContinue
 Write-Host "        Done" -ForegroundColor Green
 
