@@ -98,14 +98,48 @@ timeout /t 10 /nobreak >nul
 goto loop
 "@ | Set-Content "$ConfigDir\start-winremote.bat"
 
-# Wrapper script that patches Snapshot defaults for Claude-friendly image sizes
+# Wrapper script that patches Snapshot defaults and Shell timeout handling
 @"
+"""WinRemote MCP wrapper with patches for Claude Code compatibility."""
+import subprocess
 import winremote.desktop as _desktop
+import winremote.__main__ as _main
 
+# --- Patch 1: Snapshot defaults for Claude-friendly image sizes ---
 _orig_take_screenshot = _desktop.take_screenshot
 def _patched_take_screenshot(quality: int = 40, max_width: int = 1280, monitor: int = 0) -> str:
     return _orig_take_screenshot(quality=quality, max_width=max_width, monitor=monitor)
 _desktop.take_screenshot = _patched_take_screenshot
+
+# --- Patch 2: Shell timeout kills entire process tree (not just parent) ---
+_orig_subprocess_run = subprocess.run
+
+def _shell_run_with_tree_kill(args, **kwargs):
+    timeout = kwargs.pop("timeout", None)
+    if timeout is None:
+        return _orig_subprocess_run(args, **kwargs)
+    capture = kwargs.pop("capture_output", False)
+    if capture:
+        kwargs["stdout"] = subprocess.PIPE
+        kwargs["stderr"] = subprocess.PIPE
+    kwargs["creationflags"] = kwargs.get("creationflags", 0) | subprocess.CREATE_NEW_PROCESS_GROUP
+    proc = subprocess.Popen(args, **kwargs)
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+        return subprocess.CompletedProcess(args, proc.returncode, stdout, stderr)
+    except subprocess.TimeoutExpired:
+        try:
+            _orig_subprocess_run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, timeout=5)
+        except:
+            pass
+        proc.kill()
+        try:
+            proc.communicate(timeout=5)
+        except:
+            pass
+        raise
+
+_main.subprocess.run = _shell_run_with_tree_kill
 
 from winremote.__main__ import cli
 cli()
