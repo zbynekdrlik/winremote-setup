@@ -161,12 +161,12 @@ $hostName = $env:COMPUTERNAME.ToLower()
 # --- Stop old server processes ---
 Write-Host ""
 Write-Host "  Stopping old server..." -ForegroundColor Cyan
-Get-Process -Name "python*" -ErrorAction SilentlyContinue | Where-Object {
-    try { $_.CommandLine -match "winremote" } catch { $false }
+# Kill by window title (most reliable — catches python, cmd, conhost with the batch title)
+Get-Process -ErrorAction SilentlyContinue | Where-Object {
+    $_.MainWindowTitle -match "WinRemote"
 } | Stop-Process -Force -ErrorAction SilentlyContinue
-Get-Process -Name "cmd" -ErrorAction SilentlyContinue | Where-Object {
-    try { $_.MainWindowTitle -match "WinRemote" } catch { $false }
-} | Stop-Process -Force -ErrorAction SilentlyContinue
+# Also kill any remaining winremote python processes
+taskkill /F /FI "IMAGENAME eq python*" /FI "WINDOWTITLE eq *WinRemote*" 2>$null
 Start-Sleep -Seconds 2
 
 # --- Start server now (hidden) ---
