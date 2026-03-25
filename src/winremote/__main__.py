@@ -1764,7 +1764,7 @@ def cli(
         mcp.run(transport="stdio")
     else:
         logging.getLogger("uvicorn.error").addFilter(BannerFilter())
-        run_kwargs = dict(transport="streamable-http", host=host, port=port)
+        run_kwargs = dict(transport="streamable-http", host=host, port=port, stateless_http=True)
         if middleware:
             run_kwargs["middleware"] = middleware
         if platform.system() == "Windows":
