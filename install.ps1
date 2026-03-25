@@ -165,8 +165,8 @@ Write-Host "  Stopping old server..." -ForegroundColor Cyan
 Get-Process -ErrorAction SilentlyContinue | Where-Object {
     $_.MainWindowTitle -match "WinRemote"
 } | Stop-Process -Force -ErrorAction SilentlyContinue
-# Also kill any remaining winremote python processes
-taskkill /F /FI "IMAGENAME eq python*" /FI "WINDOWTITLE eq *WinRemote*" 2>$null
+# Also kill any remaining winremote python processes by name pattern
+Get-Process -Name "python*" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 2
 
 # --- Start server now (hidden) ---
