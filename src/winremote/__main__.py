@@ -513,7 +513,6 @@ def Shell(command: str, timeout: int = 30, cwd: str = "") -> str:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
         )
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
