@@ -3,7 +3,6 @@
 
 $ErrorActionPreference = "Stop"
 $Port = 8090
-$ConfigDir = "$env:USERPROFILE\.winremote-mcp"
 
 Write-Host ""
 Write-Host "  WinRemote MCP Installer" -ForegroundColor Cyan
@@ -17,6 +16,26 @@ if (-not $isAdmin) {
     Write-Host "  [!] Recommend: Right-click PowerShell > Run as Administrator" -ForegroundColor Yellow
     Write-Host ""
 }
+
+# --- Detect logged-in desktop user (may differ from SSH user) ---
+$desktopUser = $null
+try {
+    $sessions = query user 2>&1
+    foreach ($line in $sessions) {
+        if ($line -match "console" -and $line -match "Active") {
+            $desktopUser = ($line.Trim() -split "\s+")[0].TrimStart(">")
+            break
+        }
+    }
+} catch {}
+if (-not $desktopUser) { $desktopUser = $env:USERNAME }
+
+$desktopProfile = "C:\Users\$desktopUser"
+if (-not (Test-Path $desktopProfile)) { $desktopProfile = $env:USERPROFILE }
+$ConfigDir = "$desktopProfile\.winremote-mcp"
+
+Write-Host "  Target user: $desktopUser ($desktopProfile)" -ForegroundColor Gray
+Write-Host ""
 
 # --- Find or install Python ---
 Write-Host "  [1/6] Checking Python..." -ForegroundColor White
@@ -34,14 +53,58 @@ foreach ($cmd in @("python", "python3", "py")) {
 
 if (-not $python) {
     Write-Host "        Python 3.10+ not found. Installing..." -ForegroundColor Yellow
+
+    # Try winget first
+    $installed = $false
     try {
-        winget install Python.Python.3.12 --accept-package-agreements --accept-source-agreements
-        # Refresh PATH
-        $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
-        $python = "python"
-        Write-Host "        Python installed" -ForegroundColor Green
-    } catch {
-        Write-Host "        [X] Failed to install Python. Install manually from python.org" -ForegroundColor Red
+        $wv = winget --version 2>&1
+        if ($wv -match "v\d") {
+            winget install Python.Python.3.12 --accept-package-agreements --accept-source-agreements
+            $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+            $python = "python"
+            $installed = $true
+            Write-Host "        Python installed (winget)" -ForegroundColor Green
+        }
+    } catch {}
+
+    # Fallback: direct download
+    if (-not $installed) {
+        Write-Host "        winget not available, downloading directly..." -ForegroundColor Yellow
+        $installerPath = "$env:TEMP\python-3.12.10-amd64.exe"
+        try {
+            curl.exe -Lo $installerPath "https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe"
+            & $installerPath /quiet InstallAllUsers=0 PrependPath=1 Include_pip=1
+            Start-Sleep -Seconds 5
+            $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+            # Find the freshly installed python
+            foreach ($cmd in @("python", "python3")) {
+                try {
+                    $ver = & $cmd --version 2>&1
+                    if ($ver -match "Python 3") { $python = $cmd; break }
+                } catch {}
+            }
+            # Check common install paths
+            if (-not $python) {
+                $tryPaths = @(
+                    "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe",
+                    "C:\Users\$desktopUser\AppData\Local\Programs\Python\Python312\python.exe",
+                    "C:\Python312\python.exe"
+                )
+                foreach ($p in $tryPaths) {
+                    if (Test-Path $p) { $python = $p; break }
+                }
+            }
+            if ($python) {
+                Write-Host "        Python installed (direct download)" -ForegroundColor Green
+            }
+            Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+        } catch {
+            Write-Host "        [X] Direct download failed: $_" -ForegroundColor Red
+        }
+    }
+
+    if (-not $python) {
+        Write-Host "        [X] Could not install Python. Install manually from python.org" -ForegroundColor Red
         return
     }
 }
@@ -159,18 +222,22 @@ try {
     # Trigger at logon + every 5 minutes (task won't start a second instance if already running)
     $triggerLogon = New-ScheduledTaskTrigger -AtLogon
     $triggerRepeat = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5)
-    $taskPrincipal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -RunLevel Highest -LogonType Interactive
+    $taskPrincipal = New-ScheduledTaskPrincipal -UserId $desktopUser -RunLevel Highest -LogonType Interactive
     $taskSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew
     Register-ScheduledTask -TaskName "WinRemoteMCP" -Action $taskAction -Trigger @($triggerLogon, $triggerRepeat) -Principal $taskPrincipal -Settings $taskSettings -Force | Out-Null
-    Write-Host "        Task 'WinRemoteMCP' registered (at logon + every 5 min)" -ForegroundColor Green
+    Write-Host "        Task 'WinRemoteMCP' registered for $desktopUser (at logon + every 5 min)" -ForegroundColor Green
 } catch {
     Write-Host "        [!] Could not create scheduled task (need admin)" -ForegroundColor Yellow
     Write-Host "        You can start manually: $ConfigDir\start-winremote.vbs" -ForegroundColor Yellow
 }
 
-# --- Firewall ---
+# --- Firewall + Network profile ---
 Write-Host "  [6/6] Configuring firewall..." -ForegroundColor White
 try {
+    # Ensure network is Private (firewall rule only allows Private/Domain)
+    Get-NetConnectionProfile -ErrorAction SilentlyContinue | Where-Object {
+        $_.NetworkCategory -eq "Public"
+    } | Set-NetConnectionProfile -NetworkCategory Private -ErrorAction SilentlyContinue
     # Remove old rule if exists
     Remove-NetFirewallRule -DisplayName "WinRemote MCP" -ErrorAction SilentlyContinue
     New-NetFirewallRule -DisplayName "WinRemote MCP" -Direction Inbound -LocalPort $Port -Protocol TCP -Action Allow -Profile Private,Domain | Out-Null
@@ -192,26 +259,38 @@ $hostName = $env:COMPUTERNAME.ToLower()
 # --- Stop old server processes ---
 Write-Host ""
 Write-Host "  Stopping old server..." -ForegroundColor Cyan
-# Kill by window title (most reliable — catches python, cmd, conhost with the batch title)
+# Kill by window title (catches python/cmd with the batch title, avoids killing unrelated python)
 Get-Process -ErrorAction SilentlyContinue | Where-Object {
     $_.MainWindowTitle -match "WinRemote"
 } | Stop-Process -Force -ErrorAction SilentlyContinue
-# Also kill any remaining winremote python processes by name pattern
-Get-Process -Name "python*" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+# Kill winremote python by port (only the one on our port, not other pythons)
+$portPid = (netstat -ano | Select-String "0.0.0.0:$Port.*LISTENING" | ForEach-Object {
+    ($_.ToString().Trim() -split "\s+")[-1]
+}) | Select-Object -First 1
+if ($portPid) {
+    Stop-Process -Id $portPid -Force -ErrorAction SilentlyContinue
+}
 Start-Sleep -Seconds 2
+
+# --- Clean up old config from other users (if installer was run under wrong user before) ---
+$currentUserConfig = "$env:USERPROFILE\.winremote-mcp"
+if ($currentUserConfig -ne $ConfigDir -and (Test-Path $currentUserConfig)) {
+    Remove-Item -Recurse -Force $currentUserConfig -ErrorAction SilentlyContinue
+    Write-Host "  Cleaned up old config from $env:USERNAME" -ForegroundColor Gray
+}
 
 # --- Start server now (hidden) ---
 Write-Host "  Starting server..." -ForegroundColor Cyan
 Start-Process -FilePath "wscript.exe" -ArgumentList "`"$ConfigDir\start-winremote.vbs`""
-Start-Sleep -Seconds 2
+Start-Sleep -Seconds 5
 
 # Test if it's running
 $running = $false
 try {
-    $response = Invoke-WebRequest -Uri "http://localhost:$Port" -Method GET -TimeoutSec 3 -ErrorAction SilentlyContinue
+    $response = Invoke-WebRequest -Uri "http://localhost:$Port" -Method GET -TimeoutSec 5 -ErrorAction SilentlyContinue
     $running = $true
 } catch {
-    # Even a 404/405 means the server is up
+    # Even a 404/401 means the server is up
     if ($_.Exception.Response) { $running = $true }
 }
 
@@ -228,6 +307,7 @@ Write-Host "  SETUP COMPLETE" -ForegroundColor Cyan
 Write-Host "  ============================================" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "  Computer:  $hostName ($localIP)" -ForegroundColor White
+Write-Host "  User:      $desktopUser" -ForegroundColor White
 Write-Host "  Port:      $Port" -ForegroundColor White
 Write-Host "  Auth Key:  $AuthKey" -ForegroundColor Yellow
 Write-Host ""
